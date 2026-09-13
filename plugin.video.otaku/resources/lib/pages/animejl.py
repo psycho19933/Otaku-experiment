@@ -1,149 +1,151 @@
 # -*- coding: utf-8 -*-
 import re
 import urllib.parse
-import urllib.request
 from bs4 import BeautifulSoup
+from resources.lib.ui import client, control, database
 
-class Sources:
+class sources:
     def __init__(self):
         self.base_url = "https://anime-jl.net"
         self.search_url = "https://anime-jl.net/?s="
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
-            'Referer': 'https://anime-jl.net/'
-        }
 
-    def _http_get(self, url):
-        """Realiza peticiones HTTP simulando un navegador."""
+    def _get_html(self, url):
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Referer': self.base_url + '/',
+            'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8'
+        }
         try:
-            req = urllib.request.Request(url, headers=self.headers)
-            with urllib.request.urlopen(req, timeout=10) as response:
-                return response.read().decode('utf-8', errors='ignore')
+            return client.request(url, headers=headers)
         except Exception:
             return None
 
     def _clean_title(self, title):
-        """Limpia caracteres especiales para mejorar la búsqueda."""
         if not title:
             return ""
-        title = re.sub(r'\(.*?\)|\[.*?\]', '', title)
-        title = re.sub(r'[^\w\s]', ' ', title)
-        return " ".join(title.split()).strip()
+        # Quitar paréntesis, corchetes y caracteres que rompen el buscador de WordPress
+        clean = re.sub(r'\(.*?\)|\[.*?\]', '', title)
+        clean = re.sub(r'[^\w\s]', ' ', clean)
+        return " ".join(clean.split()).strip()
 
-    def get_sources(self, *args, **kwargs):
+    def get_sources(self, anilist_id, mal_id, episode, status=None, media_type=None, rescrape=False, **kwargs):
         """
-        Punto de entrada compatible con Otaku.
-        Soporta argumentos posicionales o por nombre (titles, episode, etc.)
+        Firma nativa de Otaku para invocar scrapers en resources/lib/pages/
         """
-        titles = []
-        episode = "1"
+        sources_list = []
+        episode = str(episode)
 
-        # Otaku suele pasar: get_sources(titles, episode, ...)
-        if len(args) >= 1:
-            if isinstance(args[0], dict):
-                titles.extend([v for v in args[0].values() if isinstance(v, str)])
-            elif isinstance(args[0], list):
-                titles.extend(args[0])
-            elif isinstance(args[0], str):
-                titles.append(args[0])
+        # 1. Obtener los nombres del anime desde la base de datos interna de Otaku
+        titles_to_try = []
+        try:
+            show = database.get_show(anilist_id)
+            if show:
+                if show.get('name'):
+                    titles_to_try.append(show.get('name'))
+                if show.get('ename'):
+                    titles_to_try.append(show.get('ename'))
+                # Sinónimos o nombres en español si existen
+                alt_titles = show.get('titles', [])
+                if isinstance(alt_titles, list):
+                    titles_to_try.extend(alt_titles)
+        except Exception:
+            pass
 
-        if len(args) >= 2:
-            episode = str(args[1])
-        elif 'episode' in kwargs:
-            episode = str(kwargs['episode'])
-
-        if 'titles' in kwargs:
+        # Fallback si se pasaron títulos directamente por kwargs
+        if not titles_to_try and 'titles' in kwargs:
             t = kwargs['titles']
-            if isinstance(t, dict):
-                titles.extend([v for v in t.values() if isinstance(v, str)])
-            elif isinstance(t, list):
-                titles.extend(t)
+            titles_to_try = list(t.values()) if isinstance(t, dict) else list(t)
 
-        sources = []
-        anime_urls = []
+        anime_url = None
 
-        # 1. Buscar en Anime-JL probando las variantes del título
-        for t in titles:
-            clean = self._clean_title(t)
-            if not clean:
+        # 2. Buscar el anime en Anime-JL probando las variantes de título
+        for t in titles_to_try:
+            query = self._clean_title(t)
+            if not query:
                 continue
-            search_query = urllib.parse.quote_plus(clean)
-            html = self._http_get(f"{self.search_url}{search_query}")
+
+            search_url = f"{self.search_url}{urllib.parse.quote_plus(query)}"
+            html = self._get_html(search_url)
             if not html:
                 continue
 
             soup = BeautifulSoup(html, 'html.parser')
 
-            # Anime-JL lista los resultados dentro de artículos / tarjetas
-            for card in soup.select('article, .item, .post, .animelist-item'):
-                link = card.find('a', href=True)
-                if link and '/ver/' not in link['href']:  # Evitar episodios sueltos en el buscador
-                    href = link['href']
-                    if href.startswith('/'):
-                        href = self.base_url + href
-                    if href not in anime_urls:
-                        anime_urls.append(href)
+            # En Anime-JL los resultados se listan en <article> o divs con clase post/item
+            for item in soup.select('article, .item, .post, .anime-card'):
+                link = item.find('a', href=True)
+                if not link:
+                    continue
+                href = link['href']
 
-            if anime_urls:
+                # Evitar que tome un link directo a un episodio en la búsqueda general
+                if '/episodio' not in href and '/ver/' not in href:
+                    anime_url = href if href.startswith('http') else self.base_url + href
+                    break
+                elif not anime_url:
+                    # Si no hay ficha de anime, tomar el enlace base
+                    anime_url = href
+
+            if anime_url:
                 break
 
-        if not anime_urls:
-            return sources
+        if not anime_url:
+            return sources_list
 
-        # 2. Localizar el episodio objetivo
+        # 3. Localizar el enlace del episodio específico
         ep_url = None
-        target_ep = str(episode)
-
-        for a_url in anime_urls:
-            anime_html = self._http_get(a_url)
-            if not anime_html:
-                continue
-
+        anime_html = self._get_html(anime_url)
+        if anime_html:
             soup_anime = BeautifulSoup(anime_html, 'html.parser')
-            # Buscar todos los enlaces a episodios
-            ep_links = soup_anime.find_all('a', href=True)
-            for a in ep_links:
+            # Buscar en todos los enlaces de capítulos dentro de la ficha del anime
+            for a in soup_anime.find_all('a', href=True):
                 href = a['href']
-                text = a.get_text()
+                text = a.get_text().strip().lower()
 
-                # Coincidencia por URL (ej: /episodio-48 o -48/) o por texto (ej: "Episodio 48")
-                pattern = rf'(?:episodio|capitulo|cap)[^\d]*0*{target_ep}(?:[^\d]|$)'
-                if re.search(pattern, href, re.IGNORECASE) or re.search(pattern, text, re.IGNORECASE):
+                # Patrón que busca "episodio X", "capitulo X" o slugs como "-X/"
+                ep_pattern = rf'(?:episodio|capitulo|cap)[^\d]*0*{episode}(?:[^\d]|$)'
+                slug_pattern = rf'[-_/]0*{episode}/?$'
+
+                if re.search(ep_pattern, text) or re.search(ep_pattern, href) or re.search(slug_pattern, href):
                     ep_url = href if href.startswith('http') else self.base_url + href
                     break
 
-            if ep_url:
-                break
+        # Si no lo halló en la ficha, probar búsqueda directa del episodio
+        if not ep_url and titles_to_try:
+            direct_search = f"{self.search_url}{urllib.parse.quote_plus(self._clean_title(titles_to_try[0]) + ' episodio ' + episode)}"
+            search_html = self._get_html(direct_search)
+            if search_html:
+                soup_direct = BeautifulSoup(search_html, 'html.parser')
+                first_res = soup_direct.select_one('article a, .item a, .post a')
+                if first_res and first_res.get('href'):
+                    ep_url = first_res['href']
 
         if not ep_url:
-            return sources
+            return sources_list
 
-        # 3. Extraer enlaces de los reproductores del episodio
-        ep_html = self._http_get(ep_url)
+        # 4. Extraer los reproductores de video (embeds/iframes)
+        ep_html = self._get_html(ep_url)
         if not ep_html:
-            return sources
+            return sources_list
 
         soup_ep = BeautifulSoup(ep_html, 'html.parser')
+        raw_links = []
 
-        raw_embeds = []
-
-        # a) Buscar iframes directos
+        # Extraer iframes directos
         for iframe in soup_ep.find_all('iframe'):
             src = iframe.get('src') or iframe.get('data-src')
             if src and not src.startswith(('about:', 'javascript:')):
-                raw_embeds.append(src)
+                raw_links.append(src)
 
-        # b) Buscar scripts con data de servidores (ej. pestañas tab / video lists)
-        for s in soup_ep.find_all('script'):
-            if s.string and ('video' in s.string or 'player' in s.string):
-                found = re.findall(r'(https?://[^\s"\'<>]+(?:streamwish|filemoon|mega\.nz|mp4upload|dood|streamtape)[^\s"\'<>]*)', s.string)
-                raw_embeds.extend(found)
+        # Extraer enlaces embebidos dentro de scripts o tabs del reproductor
+        for script in soup_ep.find_all('script'):
+            if script.string and any(k in script.string for k in ['streamwish', 'filemoon', 'mega.nz', 'streamtape', 'mp4upload']):
+                urls = re.findall(r'(https?://[^\s"\'<>]+(?:streamwish|filemoon|mega\.nz|streamtape|mp4upload|yourupload)[^\s"\'<>]*)', script.string)
+                raw_links.extend(urls)
 
-        # 4. Formatear para Kodi / Otaku
+        # 5. Formatear la lista según el estándar que Otaku espera
         seen = set()
-        for link in raw_embeds:
+        for link in raw_links:
             if link.startswith('//'):
                 link = 'https:' + link
 
@@ -151,35 +153,34 @@ class Sources:
                 continue
             seen.add(link)
 
-            # Identificar nombre del servidor
+            # Detectar el nombre del hoster para ResolveURL
             server_name = "Embed"
-            lower_link = link.lower()
-            if "mega.nz" in lower_link:
+            low = link.lower()
+            if "mega.nz" in low:
                 server_name = "Mega"
-            elif "streamwish" in lower_link or "wishembed" in lower_link:
+            elif "streamwish" in low or "wishembed" in low:
                 server_name = "Streamwish"
-            elif "filemoon" in lower_link:
+            elif "filemoon" in low:
                 server_name = "Filemoon"
-            elif "mp4upload" in lower_link:
-                server_name = "Mp4Upload"
-            elif "streamtape" in lower_link:
+            elif "streamtape" in low:
                 server_name = "Streamtape"
-            elif "yourupload" in lower_link:
+            elif "mp4upload" in low:
+                server_name = "Mp4Upload"
+            elif "yourupload" in low:
                 server_name = "YourUpload"
 
-            sources.append({
+            sources_list.append({
                 'release_title': f"Anime-JL Ep {episode} [{server_name}]",
-                'name': server_name,
-                'source': server_name,
-                'quality': '1080p',
-                'language': 'es',
-                'url': link,
-                'provider': 'animejl',
-                'direct': False,       # Indica a Otaku que use ResolveURL
-                'debridonly': False,
                 'hash': '',
+                'name': server_name,
+                'quality': '1080p',
+                'debrid_provider': '',
+                'provider': 'animejl',
                 'size': 'NA',
-                'info': ['LAT/SUB']
+                'info': ['ES/LAT'],
+                'lang': 2,           # 2 indica SUB / audio con subtítulos en Otaku
+                'url': link,
+                'direct': False      # Indica a Otaku que resuelva el link mediante ResolveURL
             })
 
-        return sources
+        return sources_list
